@@ -385,9 +385,15 @@ pelo terminal:
   commands={[
     {
       codeTitle: "Terminal — mensagens inválidas via Docker",
-      command: `docker run --rm eclipse-mosquitto:2 mosquitto_pub -h broker.hivemq.com -t "{course}/lab08/grupo-{group}/dht" -m lixo
-docker run --rm eclipse-mosquitto:2 mosquitto_pub -h broker.hivemq.com -t "{course}/lab08/grupo-{group}/dht" -m "{\\"t\\":\\"quente\\"}"
-docker run --rm eclipse-mosquitto:2 mosquitto_pub -h broker.hivemq.com -t "{course}/lab08/grupo-{group}/pwm" -m "{\\"modo\\":\\"turbo\\",\\"estado\\":\\"X\\",\\"aq\\":10,\\"ve\\":0}"`,
+      command: `docker run --rm eclipse-mosquitto:2 mosquitto_pub -h broker.hivemq.com -t "{course}/lab08/grupo-{group}/dht" -m lixo`,
+    },
+    {
+      codeTitle: "Terminal — mensagens inválidas via Docker",
+      command: `docker run --rm eclipse-mosquitto:2 mosquitto_pub -h broker.hivemq.com -t "{course}/lab08/grupo-{group}/dht" -m "{\\"t\\":\\"quente\\"}"`,
+    },
+    {
+      codeTitle: "Terminal — mensagens inválidas via Docker",
+      command: `docker run --rm eclipse-mosquitto:2 mosquitto_pub -h broker.hivemq.com -t "{course}/lab08/grupo-{group}/pwm" -m "{\\"modo\\":\\"turbo\\",\\"estado\\":\\"X\\",\\"aq\\":10,\\"ve\\":0}"`,
     },
   ]}
 />
@@ -549,8 +555,11 @@ pesa mais que um que durou 2 segundos.
   commands={[
     {
       codeTitle: "Terminal — trocar o modo via Docker",
-      command: `docker run --rm eclipse-mosquitto:2 mosquitto_pub -h broker.hivemq.com -t "{course}/lab08/grupo-{group}/cmd/modo" -m pot
-docker run --rm eclipse-mosquitto:2 mosquitto_pub -h broker.hivemq.com -t "{course}/lab08/grupo-{group}/cmd/modo" -m auto`,
+      command: `docker run --rm eclipse-mosquitto:2 mosquitto_pub -h broker.hivemq.com -t "{course}/lab08/grupo-{group}/cmd/modo" -m pot`,
+    },
+    {
+      codeTitle: "Terminal — trocar o modo via Docker",
+      command: `docker run --rm eclipse-mosquitto:2 mosquitto_pub -h broker.hivemq.com -t "{course}/lab08/grupo-{group}/cmd/modo" -m auto`,
     },
   ]}
 />
