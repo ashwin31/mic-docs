@@ -26,21 +26,28 @@ export type GenIotOpcoes = {
     ponteMqtt?: string;
     captura?: boolean;
     capturaFiltro?: string;
+    /** --docs: material da disciplina (Docusaurus) no portal; a disciplina vem de COURSE */
+    docs?: boolean;
+    docsModo?: "pages" | "build";
+    docsMinutos?: number;
+    docsRepo?: string;
+    docsRamo?: string;
+    docsCaminho?: string;
     extras?: string[];
 };
 
 export const PRESETS_IOT: Record<string, GenIotOpcoes> = {
-    lab00: { semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
-    lab01: { semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
-    lab02: { semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
-    lab03: { semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
-    lab04: { semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
-    lab05: { semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
-    lab06: { semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
-    lab07: { semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
-    lab08: { semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
-    lab09: { semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
-    lab10: { semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
+    lab00: { docs: true, semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
+    lab01: { docs: true, semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
+    lab02: { docs: true, semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
+    lab03: { docs: true, semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
+    lab04: { docs: true, semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
+    lab05: { docs: true, semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
+    lab06: { docs: true, semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
+    lab07: { docs: true, semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
+    lab08: { docs: true, semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
+    lab09: { docs: true, semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
+    lab10: { docs: true, semGitea: true, semMicrobin: true, semFuxa: true, semNtfy: true, captura: true },
     projeto: {},
 };
 
