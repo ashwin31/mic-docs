@@ -1,0 +1,560 @@
+---
+title: Guia — Buck em malha fechada com ESP32
+---
+
+## Checklist — conversor buck regulado {/* #checklist */}
+
+- [ ] Firmware testado **sem o conversor**, com `SIMULAR_PLANTA 1`
+- [ ] Estágio de potência montado: MOSFET no retorno, diodo, indutor, capacitor e carga
+- [ ] Dois divisores 27 kΩ / 3,3 kΩ ligados ao GPIO32 (Vin) e ao GPIO35 (nó N)
+- [ ] Calibração feita com o PWM parado: `Vo` próximo de 0 V no serial
+- [ ] Malha fechada: `Vo` segue a referência do trimpot
+- [ ] Degraus de referência, de carga e de tensão de entrada registrados
+- [ ] Limite de estabilidade encontrado aumentando `ki`
+
+Este guia continua o [guia do ESP32 no lugar do SG3525A](./guia-esp32-sg3525a.mdx). Lá o
+modulador trabalhava em **malha aberta**: o trimpot definia a razão cíclica. Aqui o ESP32
+**mede a tensão de saída** de um conversor buck e ajusta a razão cíclica sozinho para mantê-la
+igual à referência, mesmo com variação de carga e de tensão de entrada. É o papel que o
+amplificador de erro do SG3525A assume quando a conexão temporária entre os pinos 1 e 9 é
+desfeita.
+
+```mermaid
+flowchart LR
+  POT[Trimpot · referência] -->|GPIO34| SOMA((erro))
+  SOMA --> CTRL[Controlador integral]
+  CTRL -->|razão cíclica| PWM[LEDC · GPIO27 · 20,9 kHz]
+  PWM --> DRV[Interface 18 V + MOSFET]
+  DRV --> LC[Filtro L C + carga]
+  LC -->|Vo| DIV[Divisores]
+  DIV -->|GPIO32 e GPIO35| ADC[ADC1]
+  ADC -->|Vo medido| SOMA
+```
+
+:::danger[Este guia vale para baixa tensão]
+O projeto de referência usa **18 V** na entrada, a mesma fonte da experiência anterior. Para
+tensões maiores os divisores precisam ser recalculados, e com o conversor ligado ao
+retificador o ESP32 **não pode** ficar conectado ao computador pelo USB sem isolação.
+:::
+
+## Objetivos
+
+- Montar um buck com a chave no retorno, comandado pela interface do guia anterior.
+- Medir a tensão de saída com dois canais do ADC1.
+- Projetar um controlador integral a partir de L, C, da carga e da tensão de entrada.
+- Implementar o controlador com período de amostragem fixo, limite do integrador e rampa de
+  referência.
+- Observar a resposta a degraus e encontrar na prática o limite de estabilidade.
+
+## Material
+
+- A montagem do guia anterior: ESP32, trimpot no GPIO34, interface de 18 V no GPIO27 e o
+  estágio BC548/BC558 com 22 Ω e zener.
+- 1 MOSFET canal N (IRF540 ou equivalente) e 1 diodo Schottky (1N5822 ou equivalente).
+- 1 indutor de 1 mH para pelo menos 1 A.
+- 2 capacitores eletrolíticos de 470 µF / 35 V.
+- Carga: resistores de 22 Ω e 47 Ω, 10 W.
+- 2 resistores de 27 kΩ, 2 de 3,3 kΩ (1 %, se houver) e 2 capacitores de 10 nF.
+- Osciloscópio de dois canais e multímetro.
+
+---
+
+## Parte 1 — O conversor {/* #parte-1 */}
+
+A saída do guia anterior é o par **Vg / Vs**, com Vs no GND do circuito de comando. Para usar
+essa saída sem acionador flutuante, o MOSFET fica no **retorno**: fonte no GND, e a carga
+ligada entre o +Vin e o indutor.
+
+```text title="Buck com a chave no retorno"
+ +Vin ───┬──────────────┬─────────────────┬──────────┬─── saída +
+         │              │                 │          │
+        Cin          cátodo             Cout       carga
+       470 µF        diodo             470 µF        R
+         │           ânodo                │          │
+         │              │                 ├──────────┴─── saída −  (nó N)
+         │              ├────── L 1 mH ───┘
+         │            dreno
+         │           MOSFET ◄── Vg (22 Ω e zener do estágio de saída)
+         │            fonte
+ GND ────┴──────────────┴─── Vs · GND do ESP32 · GND da fonte
+```
+
+- MOSFET conduzindo: a corrente sai do +Vin, passa pela carga, pelo indutor e pelo MOSFET.
+  O indutor recebe `Vin − Vo`.
+- MOSFET aberto: a corrente do indutor fecha pelo diodo de volta ao +Vin. O indutor recebe
+  `−Vo`.
+- A tensão de saída é a **diferença** entre o +Vin e o nó N: `Vo = Vin − VN`. O nó N fica
+  em tensão contínua (filtrada pelo capacitor), e por isso pode ser medido pelo ADC.
+
+:::warning[A saída não é referenciada ao GND]
+Meça `Vo` com o multímetro **sobre a carga**. Com o ESP32 no USB, o GND do circuito está
+ligado ao terra do computador: a garra de terra do osciloscópio só pode ir ao GND. Para ver
+`Vo` no osciloscópio, ponha um canal na saída + e outro no nó N e use a função de subtração.
+:::
+
+### Projeto de referência
+
+| Grandeza                | Valor      | Constante no firmware |
+| ----------------------- | ---------- | --------------------- |
+| Tensão de entrada       | 18 V       | `VIN_NOMINAL`         |
+| Indutor                 | 1 mH       | `L_H`                 |
+| Capacitor de saída      | 470 µF     | `C_F`                 |
+| Carga                   | 22 Ω       | `R_CARGA`             |
+| Frequência de comutação | 20,9 kHz   | `F_PWM`               |
+| Faixa da referência     | 2 V a 12 V | `REF_MIN`, `REF_MAX`  |
+
+```text title="Contas do estágio de potência (Vo = 9 V)"
+D  = Vo / Vin               = 9 / 18                 = 0,50
+Io = Vo / R                 = 9 / 22                 = 0,41 A
+ΔiL = Vo × (1 − D) / (L × f) = 9 × 0,5 / (1 mH × 20,9 kHz) = 0,22 A
+condução contínua se Io > ΔiL / 2 = 0,11 A      → vale para 22 Ω e para 47 Ω
+
+f0 = 1 / (2π × √(L × C))     = 232 Hz      ressonância do filtro
+Z0 = √(L / C)               = 1,46 Ω
+Q  ≈ R / Z0                 = 15          sem contar as perdas
+```
+
+Se o seu conversor tiver outros valores, refaça essas contas e troque as constantes. O
+projeto do controlador na [Parte 3](#parte-3) parte de `f0`, `Q` e `Vin`.
+
+---
+
+## Parte 2 — Medindo a tensão de saída {/* #parte-2 */}
+
+Dois divisores iguais levam o +Vin e o nó N ao ADC1:
+
+```text title="Divisor (monte dois)"
+ +Vin ou nó N ── 27 kΩ ──┬──────── GPIO32 (Vin)  ou  GPIO35 (nó N)
+                         │
+                      3,3 kΩ ║ 10 nF
+                         │
+                        GND
+
+ fator = (27 + 3,3) / 3,3 = 9,18        18 V → 1,96 V no pino
+```
+
+| Sinal      | Pino do ESP32 | Observação                            |
+| ---------- | ------------- | ------------------------------------- |
+| Referência | **GPIO34**    | trimpot em 3V3, como no guia anterior |
+| Vin        | **GPIO32**    | divisor ligado ao +Vin                |
+| Nó N       | **GPIO35**    | divisor ligado à saída −              |
+| PWM        | **GPIO27**    | entrada da interface de 18 V          |
+| GND        | **GND**       | GND da fonte e fonte do MOSFET        |
+
+- Os três pinos de medida são do **ADC1**. O fator 9,18 mantém a leitura abaixo de 2,45 V,
+  na faixa em que o ADC do ESP32 é mais linear, para entradas de até 22 V.
+- O ADC lê mal abaixo de ~0,15 V. Como `VN = Vin − Vo`, a referência é limitada a 12 V para
+  que o nó N nunca fique perto de zero.
+- `Vo` sai da **diferença de duas leituras**, e os erros dos dois canais se somam. A
+  calibração abaixo reduz esse erro.
+
+### Calibração
+
+Com o conversor alimentado e o PWM parado (comando `r 0` no serial), a tensão sobre a carga
+é zero e os dois divisores veem a **mesma** tensão. Meça Vin com o multímetro e ajuste
+`CAL_VIN` até o serial mostrar o mesmo valor. Depois ajuste `CAL_VN` até `Vo` ficar em
+0,00 V.
+
+:::info[E com a chave no lado positivo?]
+Num buck convencional, com a saída referenciada ao GND, basta um divisor direto em `Vo`:
+troque `CHAVE_NO_RETORNO` para `0` e ligue esse divisor ao GPIO35. O controlador é o mesmo.
+O que muda é o acionamento, que passa a precisar de um acionador de gate flutuante.
+:::
+
+---
+
+## Parte 3 — O controlador {/* #parte-3 */}
+
+### 3.1 Do amplificador de erro ao firmware
+
+No circuito do SG3525A, o amplificador de erro compara a amostra da saída (pino 1) com a
+referência do trimpot (pino 2), e a rede de 3,3 nF e 220 kΩ define como o erro vira tensão de
+controle. No ESP32 a mesma função é uma conta repetida a cada **2 ms**:
+
+```text title="Controlador (a cada período de amostragem Ts)"
+erro      = referência − Vo
+integral  = integral + ki × erro × Ts          limitada entre 0 e D_MAX
+D         = integral + kp × erro               limitada entre 0 e D_MAX
+```
+
+O termo integral garante **erro nulo em regime**: enquanto houver erro, a razão cíclica
+continua mudando.
+
+### 3.2 Escolhendo o ganho
+
+Abaixo da ressonância o buck se comporta como um ganho: `Vo ≈ D × Vin`. A malha com o
+integrador cruza 0 dB em
+
+```text title="Frequência de cruzamento"
+fc = Vin × ki / (2π)
+```
+
+Na ressonância o filtro LC amplifica por `Q` e atrasa 90°, que somados aos 90° do integrador
+dão 180°. Se o ganho da malha ainda for maior que 1 nesse ponto, o conversor oscila em `f0`.
+A regra de projeto é deixar folga de pelo menos duas vezes:
+
+```text title="Projeto"
+ganho da malha em f0 = (fc / f0) × Q      manter ≤ 0,5
+
+fc ≤ f0 / (2 × Q) = 232 / (2 × 15) = 7,7 Hz        escolhido: fc = 5 Hz
+ki = 2π × fc / Vin = 2π × 5 / 18   = 1,75  (1 / V·s)
+
+constante de tempo ≈ 1 / (2π × fc) = 32 ms
+limite teórico de estabilidade:  ki = 2π × f0 / (Vin × Q) ≈ 5,4   (sem perdas)
+```
+
+- `Q = 15` é o pior caso, sem perdas. A resistência do indutor, do MOSFET e do capacitor
+  reduz o `Q` real, e o limite de `ki` na bancada fica acima de 5,4.
+- **Carga menor aumenta o Q** (`Q ≈ R / Z0`) e reduz a margem. Projete para a maior
+  resistência de carga que for usar.
+- O termo proporcional começa em **zero**. Num buck em modo tensão ele ajuda pouco: acima de
+  `f0` o filtro já atrasa 180°, e qualquer ganho proporcional maior que `1 / (Vin × Q)`
+  leva à oscilação.
+
+:::note[Por que tão lento?]
+Um controlador só integral precisa cruzar bem abaixo da ressonância. Fontes comerciais usam
+compensadores com dois zeros (tipo 3, ou PID) para cruzar acima de `f0`, ou controle por
+corrente. Este guia fica no caso mais simples, que já regula e deixa o limite visível.
+:::
+
+### 3.3 Detalhes que evitam problemas
+
+- **Limite do integrador.** Se a referência for inalcançável, o integrador para em `D_MAX`
+  em vez de crescer sem limite. Sem isso, a saída demoraria a reagir quando a referência
+  voltasse a um valor possível.
+- **Rampa de referência.** A referência interna sobe no máximo 20 V/s. É a partida suave do
+  SG3525A, agora aplicada à referência.
+- **Subtensão.** Com Vin abaixo de 8 V o firmware não chaveia e zera o integrador, como o
+  bloqueio por subtensão do CI.
+- **Sobretensão.** Se `Vo` passar de 15 V, o PWM para e só volta com o comando `x`.
+
+---
+
+## Parte 4 — Firmware {/* #parte-4 */}
+
+<FileTree root="buck-esp32" files={["platformio.ini c", "src/main.cpp c"]} />
+
+O `platformio.ini` é o mesmo do guia anterior.
+
+```cpp title="src/main.cpp"
+// Guia: conversor buck em malha fechada com ESP32 (controlador integral)
+// GPIO34 = trimpot (referência) | GPIO32 = Vin | GPIO35 = nó N | GPIO27 = PWM
+#include <Arduino.h>
+#include <Ticker.h>
+
+#define SIMULAR_PLANTA   0               // 1: testa a malha sem o conversor (modelo interno)
+#define CHAVE_NO_RETORNO 1               // 1: Vo = Vin - VN | 0: divisor direto em Vo
+
+// ---- Conversor
+#define VIN_NOMINAL 18.0f
+#define L_H         1e-3f
+#define C_F         470e-6f
+#define R_CARGA     22.0f
+#define RL_OHM      0.3f                 // perdas em série (usado só no modelo)
+
+// ---- PWM
+#define PWM_PIN   27
+#define PWM_CANAL 0
+#define F_PWM     20877                  // mesma frequência do guia anterior
+#define PWM_BITS  11                     // 2048 passos: cerca de 9 mV por passo em 18 V
+#define PWM_TOPO  (1u << PWM_BITS)
+#define D_MAX     0.90f
+
+// ---- Medição
+#define POT_PIN 34
+#define VIN_PIN 32
+#define VN_PIN  35
+#define R_SUP   27000.0f
+#define R_INF   3300.0f
+#define K_DIV   ((R_SUP + R_INF) / R_INF)
+#define CAL_VIN 1.000f                   // ajuste na calibração
+#define CAL_VN  1.000f
+#define ADC_AMOSTRAS 4
+
+// ---- Controle
+#define TS_MS         2                  // período de amostragem
+#define TS            (TS_MS / 1000.0f)
+#define REF_MIN       2.0f
+#define REF_MAX       12.0f
+#define RAMPA_V_POR_S 20.0f              // partida suave da referência
+#define VIN_MIN       8.0f               // subtensão
+#define VO_MAX        15.0f              // sobretensão
+
+float ki = 1.75f;                        // 1/(V.s)  -> fc = Vin*ki/(2*pi) = 5 Hz
+float kp = 0.0f;                         // 1/V
+
+Ticker temporizador;
+volatile bool amostraPendente = false;
+bool modoPot = true;                     // referência pelo trimpot ou pelo serial
+bool sobretensao = false;
+float refAlvo = REF_MIN, ref = 0;        // referência pedida e referência com rampa
+float vin = 0, vo = 0;
+float integral = 0, d = 0;
+const char *estado = "---";
+uint32_t passo = 0;
+
+#if SIMULAR_PLANTA
+float simVin = VIN_NOMINAL, simR = R_CARGA, simI = 0, simVo = 0;
+
+// Modelo médio do buck: avança um período de amostragem em 40 subpassos
+void simularPlanta() {
+  const float dt = TS / 40.0f;
+  for (int k = 0; k < 40; k++) {
+    simI += dt / L_H * (d * simVin - simVo - RL_OHM * simI);
+    if (simI < 0) simI = 0;              // o diodo não deixa a corrente inverter
+    simVo += dt / C_F * (simI - simVo / simR);
+  }
+}
+#endif
+
+void aoEstourarTemporizador() { amostraPendente = true; }
+
+// ------------------------------------------------- PWM: core 2.x e 3.x (como no Lab 07)
+void pwmIniciar() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttachChannel(PWM_PIN, F_PWM, PWM_BITS, PWM_CANAL);
+  ledcWrite(PWM_PIN, 0);
+#else
+  ledcSetup(PWM_CANAL, F_PWM, PWM_BITS);
+  ledcAttachPin(PWM_PIN, PWM_CANAL);
+  ledcWrite(PWM_CANAL, 0);
+#endif
+}
+
+void pwmEscrever(float razao) {
+  uint32_t duty = (uint32_t)lroundf(razao * PWM_TOPO);
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(PWM_PIN, duty);
+#else
+  ledcWrite(PWM_CANAL, duty);
+#endif
+}
+
+// ---------------------------------------------------------------- medição
+float lerVolts(uint8_t pino) {
+  uint32_t soma = 0;
+  for (int i = 0; i < ADC_AMOSTRAS; i++) soma += analogReadMilliVolts(pino);
+  return soma / (float)ADC_AMOSTRAS / 1000.0f;
+}
+
+void lerSensores() {
+#if SIMULAR_PLANTA
+  simularPlanta();                       // a planta responde à razão cíclica anterior
+  vin = simVin;
+  vo = simVo;
+#else
+  vin = lerVolts(VIN_PIN) * K_DIV * CAL_VIN;
+  float vn = lerVolts(VN_PIN) * K_DIV * CAL_VN;
+  vo = CHAVE_NO_RETORNO ? vin - vn : vn;
+#endif
+}
+
+void lerTrimpot() {
+  float v = REF_MIN + lerVolts(POT_PIN) / 3.3f * (REF_MAX - REF_MIN);
+  refAlvo = constrain(roundf(v * 10) / 10, REF_MIN, REF_MAX);   // passos de 0,1 V
+}
+
+// ---------------------------------------------------------------- controle
+void parar(const char *motivo) {
+  integral = 0;
+  d = 0;
+  ref = 0;                               // ao voltar, refaz a rampa
+  estado = motivo;
+  pwmEscrever(0);
+}
+
+void controlar() {
+  lerSensores();
+  if (vo > VO_MAX) sobretensao = true;
+  if (sobretensao) { parar("SOBRETENSAO"); return; }
+  if (vin < VIN_MIN) { parar("SUBTENSAO"); return; }
+
+  float degrau = RAMPA_V_POR_S * TS;                    // rampa da referência
+  ref += constrain(refAlvo - ref, -degrau, degrau);
+
+  float erro = ref - vo;
+  integral = constrain(integral + ki * erro * TS, 0.0f, D_MAX);   // integrador limitado
+  d = constrain(integral + kp * erro, 0.0f, D_MAX);
+  pwmEscrever(d);
+  estado = (d >= D_MAX) ? "SATURADO" : "REGULANDO";
+}
+
+// ---------------------------------------------------------------- comandos
+void lerComando() {
+  if (!Serial.available()) return;
+  String s = Serial.readStringUntil('\n');
+  s.trim();
+  if (s.length() == 0) return;
+  float v = s.substring(1).toFloat();
+  switch (tolower(s[0])) {
+    case 'r': modoPot = false; refAlvo = constrain(v, 0.0f, REF_MAX); break;
+    case 'p': modoPot = true; break;
+    case 'i': ki = v; break;
+    case 'g': kp = v; break;
+    case 'x': sobretensao = false; break;
+#if SIMULAR_PLANTA
+    case 'c': if (v >= 1) simR = v; break;              // carga do modelo, em ohms
+    case 'v': simVin = v; break;                        // tensão de entrada do modelo
+#endif
+    default: Serial.println("[CMD] r <V> | p | i <ki> | g <kp> | x"); return;
+  }
+  Serial.printf("[CMD] ref=%.1f V (%s)  ki=%.2f  kp=%.4f\r\n",
+                refAlvo, modoPot ? "trimpot" : "serial", ki, kp);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.setTimeout(10);
+  delay(200);
+  Serial.println("\r\n=== Buck em malha fechada ===");
+  if (SIMULAR_PLANTA) Serial.println("[SIM] modelo interno: o conversor nao esta sendo medido");
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(POT_PIN, ADC_11db);
+  analogSetPinAttenuation(VIN_PIN, ADC_11db);
+  analogSetPinAttenuation(VN_PIN, ADC_11db);
+
+  pwmIniciar();
+  temporizador.attach_ms(TS_MS, aoEstourarTemporizador);
+}
+
+void loop() {
+  lerComando();
+  if (!amostraPendente) return;
+  amostraPendente = false;
+  passo++;
+
+  if (modoPot && passo % 50 == 0) lerTrimpot();         // a cada 100 ms
+  controlar();
+
+  if (passo % 100 == 0) {                               // a cada 200 ms
+    Serial.printf("[BUCK] t=%.1f s  Vin=%.1f V  ref=%.2f V  Vo=%.2f V  D=%.1f %%  %s\r\n",
+                  millis() / 1000.0f, vin, ref, vo, 100.0f * d, estado);
+  }
+}
+```
+
+### Comandos pelo monitor serial
+
+Envie cada comando com fim de linha.
+
+| Comando   | Efeito                                                                 |
+| --------- | ---------------------------------------------------------------------- |
+| `r 9`     | referência de 9 V pelo serial (o trimpot é ignorado); `r 0` para o PWM |
+| `p`       | volta a usar o trimpot                                                 |
+| `i 3.5`   | muda `ki` com o conversor funcionando                                  |
+| `g 0.002` | muda `kp`                                                              |
+| `x`       | rearma depois de uma sobretensão                                       |
+| `c 44`    | só no modelo: muda a carga para 44 Ω                                   |
+| `v 15`    | só no modelo: muda a tensão de entrada para 15 V                       |
+
+---
+
+## Parte 5 — Testar a malha sem o conversor {/* #parte-5 */}
+
+Com `SIMULAR_PLANTA 1`, o firmware troca as leituras do ADC por um **modelo do buck**
+calculado no próprio ESP32 (ou no Wokwi, com o mesmo `diagram.json` do guia anterior). O
+controlador não sabe a diferença. Use esse modo para conferir o código e ensaiar os degraus
+antes de energizar a placa.
+
+Envie `r 0`, espere a saída zerar e envie `r 9`:
+
+```text title="Monitor serial (modelo, valores aproximados)"
+=== Buck em malha fechada ===
+[SIM] modelo interno: o conversor nao esta sendo medido
+[CMD] ref=9.0 V (serial)  ki=1.75  kp=0.0000
+[BUCK] t=3.2 s  Vin=18.0 V  ref=4.00 V  Vo=3.40 V  D=19.0 %  REGULANDO
+[BUCK] t=3.4 s  Vin=18.0 V  ref=8.00 V  Vo=7.39 V  D=41.6 %  REGULANDO
+[BUCK] t=3.6 s  Vin=18.0 V  ref=9.00 V  Vo=8.99 V  D=50.6 %  REGULANDO
+[BUCK] t=3.8 s  Vin=18.0 V  ref=9.00 V  Vo=9.00 V  D=50.7 %  REGULANDO
+```
+
+Durante a rampa a saída fica cerca de 0,6 V atrás da referência: é a rampa de 20 V/s
+multiplicada pela constante de tempo de 32 ms. Em regime, `D` fica um pouco acima de 50 %
+para compensar a queda nas perdas em série.
+
+O que o modelo prevê para o projeto de referência:
+
+| Ensaio no modelo                        | Resultado previsto                                                       |
+| --------------------------------------- | ------------------------------------------------------------------------ |
+| Partida até 9 V                         | sem sobressinal apreciável, regime em cerca de 0,5 s                     |
+| Carga de 22 Ω para 44 Ω (`c 44`)        | pico de cerca de 0,15 V, volta a 9 V em cerca de 0,1 s                   |
+| Vin de 18 V para 15 V (`v 15`)          | afundamento até cerca de 7,5 V, depois volta a 9 V com D próximo de 61 % |
+| `ki` crescente, perdas de 0,3 Ω         | oscilação sustentada aparece entre `ki` = 14 e 20                        |
+| `ki` crescente, sem perdas (`RL_OHM 0`) | oscilação sustentada aparece entre `ki` = 5 e 7                          |
+| `kp` crescente, com `ki` = 1,75         | oscilação aparece entre `kp` = 0,01 e 0,03                               |
+
+:::info[O modelo é uma aproximação]
+Ele é um modelo médio: não tem a ondulação de comutação, o ruído do ADC, o atraso da
+interface nem a resistência série do capacitor. Serve para validar a lógica e a ordem de
+grandeza. Os números da bancada serão diferentes, e essa diferença é parte do relatório.
+:::
+
+---
+
+## Parte 6 — Roteiro na bancada {/* #parte-6 */}
+
+Volte para `SIMULAR_PLANTA 0` e grave o firmware.
+
+1. **Malha aberta primeiro.** Com a carga de 22 Ω e a fonte limitada em corrente (1 A),
+   envie `r 0` e faça a [calibração](#parte-2). Confira no osciloscópio que Vg está em nível
+   baixo.
+2. **Fechar a malha.** Envie `r 5`. A saída deve subir em rampa e parar em 5 V. Meça `Vo`
+   com o multímetro sobre a carga e compare com o serial.
+3. **Regulação estática.** Leve a referência a 9 V. Anote `Vo` e `D` para 22 Ω e para 47 Ω.
+   Depois varie a fonte entre 15 V e 20 V e anote de novo.
+4. **Degrau de referência.** Alterne `r 6` e `r 9` e registre `Vo` no osciloscópio.
+5. **Degrau de carga.** Com 9 V na saída, ligue e desligue um segundo resistor em paralelo
+   com a carga. Registre o pico e o tempo de recuperação.
+6. **Limite de estabilidade.** Com a carga de 47 Ω, aumente `ki` com o comando `i`
+   (3,5 · 5 · 7 · 10 ...) até a saída oscilar. Anote o valor e a frequência da oscilação.
+   Volte para `i 1.75`.
+
+| Medida                                      | Previsto                | Medido |
+| ------------------------------------------- | ----------------------- | ------ |
+| `Vo` com referência de 9 V, 22 Ω            | 9,0 V                   |        |
+| `D` com referência de 9 V, 22 Ω             | pouco acima de 50 %     |        |
+| `Vo` com 47 Ω                               | 9,0 V                   |        |
+| `Vo` com Vin de 15 V e de 20 V              | 9,0 V                   |        |
+| Tempo de acomodação, degrau de 6 V para 9 V | cerca de 0,15 s a 0,3 s |        |
+| Pico no degrau de carga                     | décimos de volt         |        |
+| `ki` no limite de estabilidade              | acima de 5,4            |        |
+| Frequência da oscilação no limite           | próxima de 232 Hz       |        |
+
+:::tip[Preveja antes de medir]
+
+- **P1:** em malha aberta, o que acontece com `Vo` quando a carga passa de 22 Ω para 47 Ω? E
+  em malha fechada? Qual variável o controlador muda para compensar?
+- **P2:** a oscilação do item 6 aparece primeiro com 22 Ω ou com 47 Ω? Use `Q ≈ R / Z0`.
+- **P3:** troque o capacitor de saída por um de 100 µF. Para onde vai `f0`? O `ki` de 1,75
+  fica mais ou menos conservador?
+- **P4:** a medida de `Vo` vem de duas leituras do ADC. Se cada canal errar 2 % em sentidos
+  opostos com Vin = 18 V e Vo = 9 V, de quanto é o erro em `Vo`? O controlador consegue
+  corrigir esse erro?
+
+:::
+
+---
+
+## Parte 7 — Limites deste projeto {/* #parte-7 */}
+
+| Aspecto              | Como está                                                 | Caminho para melhorar                                          |
+| -------------------- | --------------------------------------------------------- | -------------------------------------------------------------- |
+| Velocidade da malha  | cruzamento em 5 Hz, bem abaixo de `f0`                    | compensador com dois zeros (PID) ou controle por corrente      |
+| Variação de Vin      | corrigida só pelo integrador, com afundamento             | _feedforward_: dividir a saída do controlador por `Vin` medido |
+| Amostragem           | 2 ms pelo `Ticker`, com variação de alguns microssegundos | amostrar em sincronismo com o PWM                              |
+| Proteção             | sobretensão e subtensão em firmware, a cada 2 ms          | limite de corrente em hardware                                 |
+| Medição de `Vo`      | diferença de dois canais                                  | amplificador de diferença, ou chave no lado positivo           |
+| Condução descontínua | não tratada: com carga muito leve o ganho da planta muda  | manter carga mínima                                            |
+
+## Se algo não funcionar {/* #problemas */}
+
+| Sintoma                                       | Verifique                                                                              |
+| --------------------------------------------- | -------------------------------------------------------------------------------------- |
+| Estado `SUBTENSAO` com a fonte ligada         | divisor de Vin no GPIO32; valor de `K_DIV`; GND comum                                  |
+| `Vo` negativo ou absurdo com o PWM parado     | divisores trocados entre GPIO32 e GPIO35; calibração                                   |
+| Estado `SATURADO` e `Vo` abaixo da referência | referência maior do que `D_MAX × Vin`; fonte em limite de corrente; MOSFET sem comando |
+| `Vo` sobe até Vin e dá `SOBRETENSAO`          | MOSFET em curto ou interface invertida; sinal do erro; `CHAVE_NO_RETORNO` errado       |
+| Saída oscila em torno de 230 Hz               | `ki` alto para a carga usada; `kp` diferente de zero                                   |
+| `Vo` do serial difere do multímetro           | multímetro sobre a carga, não em relação ao GND; refaça a calibração                   |
+| Leituras ruidosas                             | capacitores de 10 nF nos divisores; fios curtos; GND do ESP32 junto à fonte do MOSFET  |
